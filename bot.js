@@ -1,22 +1,23 @@
-const { Client, GatewayIntentBits } = require('discord.js');
-const { joinVoiceChannel, createAudioReceiver, EndBehaviorType } = require('@discordjs/voice');
+const { 
+    Client, 
+    GatewayIntentBits 
+} = require('discord.js');
+
+const { 
+    joinVoiceChannel, 
+    createAudioPlayer, 
+    createAudioResource, 
+    AudioPlayerStatus, 
+    EndBehaviorType 
+} = require('@discordjs/voice');
+
 const fs = require('fs');
+const path = require('path');
+const { execSync } = require('child_process');
 const prism = require('prism-media');
 
-// Load settings.json for bot token and configurations
 const config = require('./config/settings.json');
 
-// Debugging: Print the token length (not full token for security)
-console.log("🔍 Bot Token Length:", config.DISCORD_BOT_TOKEN.length);
-console.log("🔍 First 5 characters of token:", config.DISCORD_BOT_TOKEN.slice(0, 5) + '...');
-
-// Ensure the bot token exists before logging in
-if (!config.DISCORD_BOT_TOKEN || config.DISCORD_BOT_TOKEN.length < 50) {
-    console.error("❌ ERROR: Invalid or missing bot token. Please check settings.json!");
-    process.exit(1);
-}
-
-// Create the bot client with necessary intents
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -26,54 +27,108 @@ const client = new Client({
     ]
 });
 
-// Event: Bot is ready
+let connection;
+let recordingUser = null;
+
 client.once('ready', () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
-// Event: Bot receives a command in a text channel
 client.on('messageCreate', async (message) => {
     if (message.content === '!join') {
         if (!message.member.voice.channel) {
             return message.reply('❌ You must be in a voice channel to use this command!');
         }
 
-        const connection = joinVoiceChannel({
+        connection = joinVoiceChannel({
             channelId: message.member.voice.channelId,
             guildId: message.guild.id,
             adapterCreator: message.guild.voiceAdapterCreator,
         });
 
-        message.reply('✅ Joined and recording!');
-        startRecording(connection);
+        message.reply('✅ Joined the voice channel and ready to listen!');
+        startListening();
     }
 });
 
-// Function: Start recording voice channel
-function startRecording(connection) {
+function startListening() {
     const receiver = connection.receiver;
 
     receiver.speaking.on('start', (userId) => {
         console.log(`🎙️ Recording user ${userId}`);
 
-        const audioStream = receiver.subscribe(userId, {
-            end: { behavior: EndBehaviorType.AfterSilence, duration: 1000 }
-        });
+        // Ensure the recordings directory exists
+        if (!fs.existsSync("./recordings")) {
+            fs.mkdirSync("./recordings");
+        }
 
         const outputPath = `./recordings/${userId}.pcm`;
         const outputStream = fs.createWriteStream(outputPath);
 
-        const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
+        // Use Opus decoder to get raw PCM
+        const decoder = new prism.opus.Decoder({ rate: 48000, channels: 1, frameSize: 960 });
+
+        const audioStream = receiver.subscribe(userId, {
+            end: {
+                behavior: EndBehaviorType.AfterSilence,
+                duration: 1000 // Stop recording after 1 second of silence
+            }
+        });
+
         audioStream.pipe(decoder).pipe(outputStream);
 
-        audioStream.on('end', () => {
+        outputStream.on('finish', () => {
             console.log(`✅ Finished recording ${userId}`);
+            processRecording(outputPath);
+        });
+
+        outputStream.on('error', (error) => {
+            console.error("[ERROR] Writing audio file failed:", error);
         });
     });
 }
 
-// Attempt to log in with bot token
-client.login(config.DISCORD_BOT_TOKEN).catch((error) => {
-    console.error("❌ Failed to login! Error:", error);
-    console.error("🔎 Check if the token is correct and your bot is in a server.");
-});
+function processRecording(pcmFile) {
+    try {
+        console.log(`🎼 Converting ${pcmFile} to WAV...`);
+        execSync(`python python-scripts/convert_audio.py`);
+
+        console.log(`📜 Transcribing audio...`);
+        execSync(`python python-scripts/transcribe.py`);
+
+        console.log(`🤖 Generating AI response...`);
+        execSync(`python python-scripts/generate_response.py`);
+
+        console.log(`🔊 Converting AI response to speech...`);
+        execSync(`python python-scripts/text_to_speech.py`);
+
+        console.log(`🎤 Playing AI response...`);
+        playLatestAudio();
+    } catch (error) {
+        console.error('[ERROR] Processing failed:', error);
+    }
+}
+
+function playLatestAudio() {
+    const recordingsDir = './recordings';
+    const mp3Files = fs.readdirSync(recordingsDir).filter(file => file.endsWith('.mp3'));
+
+    if (mp3Files.length === 0) return console.log('[ERROR] No MP3 files found.');
+
+    const latestMp3 = mp3Files.sort((a, b) => 
+        fs.statSync(path.join(recordingsDir, b)).mtimeMs - fs.statSync(path.join(recordingsDir, a)).mtimeMs
+    )[0];
+
+    const resource = createAudioResource(path.join(recordingsDir, latestMp3));
+    const player = createAudioPlayer();
+    connection.subscribe(player);
+    player.play(resource);
+
+    console.log(`🎤 Now playing: ${latestMp3}`);
+
+    player.on(AudioPlayerStatus.Idle, () => {
+        console.log('✅ Playback finished.');
+    });
+}
+
+client.login(config.DISCORD_BOT_TOKEN);
