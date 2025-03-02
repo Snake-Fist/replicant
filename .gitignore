@@ -1,3 +1,5 @@
 # Ignore environment and config files
 .env
 config/settings.json
+recordings/*
+!recordings/.gitkeep
